@@ -1,0 +1,253 @@
+#!/bin/sh
+
+warn() {
+	echo "\033[93m$@\033[0m"
+}
+
+err() {
+	echo "\033[91m$@\033[0m"
+}
+
+# normalize `$PWD`
+cd "$HOME"
+
+# handle CLI args
+for i in $@; do
+	# print help menu
+	case "$i" in
+		"-h"|"--help")
+cat << EOF
+  --help / -h
+      show this help menu
+  --dry / -d
+      dont execute bind commands
+  --show-bind / -s
+      prints out the currently pressed key sequence
+EOF
+			exit
+			;;
+
+		# set `$DRY`
+		"-d"|"--dry")
+			DRY="true"
+			;;
+
+		# set `$PRINT`
+		"-s"|"--show-bind")
+			PRINT="true"
+			;;
+	esac
+done
+
+# loads the keymap via `xmodmap`
+load_keymap() {
+	IFS=""
+
+	# do nothing if the keymap is already cached
+	[ "$KEYMAP" != "" ] && return
+
+	# get keymap, and make it lowercase
+	KEYMAP="$(xmodmap -pke | tr "[:upper:]" "[:lower:]")"
+}
+
+# checks whether a key is in the keymap
+valid_key() {
+	# make sure keymap is loaded
+	load_keymap
+
+	# check for `$1` in `$KEYMAP`, case insensitively
+	echo "$KEYMAP" | grep -qi "^keycode.*= $1" && {
+		# key is found, therefore valid
+		return 0
+	}
+
+	# key is not found, therefore invalid
+	return 1
+}
+
+# returns key from `$KEYMAP` given a keycode
+get_key() {
+	# make sure keymap is loaded
+	load_keymap
+
+	# get line with `$1` (the keycode) on it if it exists
+	KEYCODE_LINE="$(echo "$KEYMAP" | grep -Eo "keycode.*$1 = .*")"
+
+	# do nothing if keycode isn't valid
+	[ "$KEYCODE_LINE" = "" ] && return
+
+	# remove everything except the name of the key
+	echo "$KEYCODE_LINE" | \
+		sed -e 's/keycode.*= //' -e '1{s/ .*//;q}'
+}
+
+# where to store runtime data
+TMP="/tmp/$USER-sss"
+
+# path to FIFO
+FIFO="$TMP/fifo"
+
+# remove previous instance data, if any
+rm -rf "$TMP"
+
+# create folder structure
+mkdir -p "$TMP/held"
+
+# create FIFO
+mkfifo "$FIFO"
+
+# creates a bind, `$1` is the key sequence, `$2` is the command
+bind() {
+	echo "$1" | tr '+' '\n' | while read -r i; do
+		valid_key "$i" || {
+			warn "invalid key: \"$i\", in: $1"
+			return 1
+		}
+	done
+
+	# normalizes `$1` by splitting it on occurrences of "+", making it
+	# lowercase, sorting it, then re-inserting "+"
+	BIND="$(printf "%s" "$1" | tr '+' '\n' | \
+		tr "[:upper:]" "[:lower:]" | sort | \
+		printf "%s" "$(cat -)" | tr '\n' '+')"
+
+	[ -e "$TMP/binds/$BIND" ] && {
+		warn "bind already exists: $1"
+		return 1
+	}
+
+	# make bind file with command inside
+	echo "$2" > "$TMP/binds/$BIND"
+}
+
+# get PID of existing `xinput` instance if there is one
+EXISTING_XINPUT_PID="$(pgrep -x --oldest "xinput")"
+
+# is `xinput` already running?
+[ "$EXISTING_XINPUT_PID" != "" ] && {
+	# get PID of existing `sss` instance if there is one
+	EXISTING_SSS_PID="$(pgrep -xA --oldest "sss")"
+
+	# if `sss` is already running, exit and inform as such
+	[ "$EXISTING_SSS_PID" ] && {
+		err "already running: $EXISTING_SSS_PID"
+		exit 1
+	}
+
+	# if just `xinput` is already running, exit and inform as such
+	err "xinput executable is already running: $EXISTING_XINPUT_PID"
+	exit 1
+}
+
+# if we're not running dry, then load configs/binds
+[ "$DRY" != "true" ] && {
+	# make binds folder
+	mkdir -p "$TMP/binds"
+
+	# get config folder path
+	CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/sss"
+
+	# make sure config folders exist
+	mkdir -p "$CONFIG/rc.d"
+
+	# load `$CONFIG/rc`
+	[ -f "$CONFIG/rc" ] && . "$CONFIG/rc"
+
+	# load `$CONFIG/rc.d/*`
+	for i in "$CONFIG"/*; do
+		[ -f "$CONFIG/$i" ] && . "$CONFIG/$i"
+	done
+}
+
+{ # start `xinput` and send filtered output to `$FIFO`
+	# events we care about
+	EVENTS="KeyPress|KeyRelease|ButtonPress|ButtonRelease"
+
+	# actually start `xinput` and filter everything but lines with
+	# `$EVENTS` in it, and then the 7 lines after that
+	#
+	# the first 7 lines have the `detail` and `buttons` property, which
+	# is the keycode and mouse button respectively
+	xinput test-xi2 --root | \
+		stdbuf -oL grep -Ew "$EVENTS" -A 7 >> "$FIFO"
+} &
+
+# read FIFO (input events)
+cat "$FIFO" | while read -r i; do
+	while read -r ii; do
+		case "$ii" in
+			# set `$EVENT_TYPE` to the correct event
+			*"(KeyPress)"*) EVENT_TYPE="KeyPress" ;;
+			*"(KeyRelease)"*) EVENT_TYPE="KeyRelease" ;;
+			*"(ButtonPress)"*) EVENT_TYPE="ButtonPress" ;;
+			*"(ButtonRelease)"*) EVENT_TYPE="ButtonRelease" ;;
+
+			# are we on a line with a keycode or mouse button number?
+			*"detail:"*|*"buttons:"*)
+				# get keycode/mouse button number
+				KEYCODE="$(echo "$ii" | grep -Eo "[0-9]*")"
+
+				# if no `$EVENT_TYPE` is set, and `$KEYCODE` is somehow
+				# empty, we back out now
+				[ "$EVENT_TYPE" = "" ] && [ "$KEYCODE" = "" ] && {
+					continue
+				}
+
+				# format `$KEY` according to event type
+				case "$EVENT_TYPE" in
+					"Key"*)
+						KEY="$(get_key "$KEYCODE")"
+						;;
+					"Button"*)
+						KEY="button$KEYCODE"
+						;;
+				esac
+
+				# create or remove key held file according to event type
+				case "$EVENT_TYPE" in
+					# create key held file (key was pressed)
+					"KeyPress"|"ButtonPress")
+						touch "$TMP/held/$KEY"
+						;;
+					# remove key held file (key was released)
+					"KeyRelease"|"ButtonRelease")
+						rm -f "$TMP/held/$KEY"
+						;;
+				esac
+
+				# list of keys held with "+" as the key separator
+				# effectively the key sequence
+				HELD=""
+
+				# run through files held files sorted
+				for iii in $(ls "$TMP"/held | sort); do
+					# add `$iii` to `$HELD` with or without prefix
+					# depending on whether it was previously empty
+					[ "$HELD" = "" ] && {
+						HELD="$iii"
+					} || {
+						HELD="$HELD+$iii"
+					}
+				done
+
+				# should we print the currently held key sequence
+				[ "$PRINT" = "true" ] && {
+					printf "$HELD\033[0K\r"
+				}
+
+				# if we're not running dry and there's a bind matching
+				# the held key sequence, then run its command
+				[ -f "$TMP/binds/$HELD" ] && [ "$DRY" != "true" ] && {
+					sh "$TMP/binds/$HELD" &
+				}
+
+				# clear variables
+				BUTTON=""
+				KEYCODE=""
+				EVENT_TYPE=""
+				;;
+
+			*) continue ;;
+		esac
+	done
+done

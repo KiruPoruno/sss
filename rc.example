@@ -1,0 +1,27 @@
+# this is an example of an sss rc file, these can either be placed
+# `$XDG_CONFIG_HOME/sss/rc` or `$XDG_CONFIG_HOME/sss/rc.d/`
+#
+# the first being an rc file, the latter of which being a folder that
+# contains rc files, they'll be all be run in alphanumeric order
+#
+# an rc file is actually just a shell script, where `bind` is a function
+# from sss that binds keys. the first argument is the key sequence, the
+# second is the command to run.
+#
+# meaning: `bind "Control_L+A" "xdg-open https://ooo.eeeee.ooo"`
+# will bind left Ctrl+A to likely open the website in your browser
+#
+# key names are taken from the first key name in `xmodmap -pke` for all
+# the keys in the keymap, only difference is that it's case insensitive
+#
+# you can also use `sss --show-key` and it'll print out the currently
+# held/active keys in the correct format. the order of the keys in a key
+# sequence dont matter, and the one that's printed is just
+# alphanumerically sorted
+
+# go to next/previous desktop/workspace
+bind "Control_L+Alt_L+Left" "xdotool set_desktop --relative -- -1"
+bind "Control_L+Alt_L+Right" "xdotool set_desktop --relative 1"
+
+# toggle fullscreen on active window
+bind "Alt_L+F11" "wmctrl -r :ACTIVE: -b toggle,fullscreen"
